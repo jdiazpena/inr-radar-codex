@@ -1,0 +1,1225 @@
+# -*- coding: utf-8 -*-
+"""
+train_radar_2d_curv_grad.py
+
+Train a 2D INR on one prepared AMISR slice.
+
+Current experiment:
+    f_theta(x_norm, y_norm) -> normalized log10(Ne)
+
+Loss:
+    total_loss =
+        data_loss
+        + lambda_curv_eff * curv_loss
+        + lambda_gradcap_eff * gradcap_loss
+
+where:
+    data_loss:
+        MSE at real measured radar points.
+
+    curv_loss:
+        curvature / anti-ringing loss at collocation points.
+
+    gradcap_loss:
+        only penalizes gradients larger than a data-derived threshold.
+
+The gradient cap is estimated from the measured data using local Delaunay edges:
+
+    observed_gradient_ij = abs(log10Ne_i - log10Ne_j) / distance_ij_km
+
+Then:
+
+    grad_cap = grad_cap_factor * percentile(observed_gradient_ij)
+
+Example:
+    --grad_cap_percentile 90
+    --grad_cap_factor 5
+
+means:
+    allow gradients up to 5 times the 90th percentile of observed local gradients.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from scipy.spatial import Delaunay
+from tqdm import tqdm
+
+from datasets import RadarSliceDataset
+from models import MLPINR
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+
+def append_csv_row(path: Path, fieldnames: list[str], row: dict) -> None:
+    file_exists = path.exists()
+
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+        if not file_exists:
+            writer.writeheader()
+
+        writer.writerow(row)
+
+
+def sample_batch(
+    coords: torch.Tensor,
+    values: torch.Tensor,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    n_samples = coords.shape[0]
+
+    if batch_size <= 0 or batch_size >= n_samples:
+        idx = torch.arange(n_samples, device=coords.device)
+    else:
+        idx = torch.randperm(n_samples, device=coords.device)[:batch_size]
+
+    return coords[idx], values[idx]
+
+
+def compute_metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, float]:
+    pred = np.asarray(pred, dtype=float)
+    target = np.asarray(target, dtype=float)
+
+    residual = pred - target
+    abs_residual = np.abs(residual)
+
+    mse = float(np.mean(residual ** 2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(abs_residual))
+    bias = float(np.mean(residual))
+    max_abs = float(np.max(abs_residual))
+    p95_abs = float(np.quantile(abs_residual, 0.95))
+    p99_abs = float(np.quantile(abs_residual, 0.99))
+
+    return {
+        "mse": mse,
+        "rmse": rmse,
+        "mae": mae,
+        "bias": bias,
+        "max_abs": max_abs,
+        "p95_abs": p95_abs,
+        "p99_abs": p99_abs,
+    }
+
+
+def ramp_weight(
+    target_weight: float,
+    step: int,
+    num_steps: int,
+    ramp_frac: float,
+) -> float:
+    if target_weight <= 0.0:
+        return 0.0
+
+    if ramp_frac <= 0.0:
+        return float(target_weight)
+
+    ramp_steps = max(1, int(ramp_frac * num_steps))
+    factor = min(1.0, step / ramp_steps)
+
+    return float(target_weight * factor)
+
+
+# ============================================================
+# GRID, MASK, AND COLLOCATION HELPERS
+# ============================================================
+
+def make_query_grid_from_points(
+    x_km: np.ndarray,
+    y_km: np.ndarray,
+    nx: int,
+    ny: int,
+    padding_frac: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    x_min = float(np.min(x_km))
+    x_max = float(np.max(x_km))
+    y_min = float(np.min(y_km))
+    y_max = float(np.max(y_km))
+
+    dx = x_max - x_min
+    dy = y_max - y_min
+
+    x_min -= padding_frac * dx
+    x_max += padding_frac * dx
+    y_min -= padding_frac * dy
+    y_max += padding_frac * dy
+
+    x_grid = np.linspace(x_min, x_max, nx)
+    y_grid = np.linspace(y_min, y_max, ny)
+
+    X, Y = np.meshgrid(x_grid, y_grid)
+
+    return X, Y
+
+
+def estimate_nearest_radius(
+    measured_xy: np.ndarray,
+    factor: float,
+) -> float:
+    measured_xy = np.asarray(measured_xy, dtype=float)
+
+    diff = measured_xy[:, None, :] - measured_xy[None, :, :]
+    dist = np.sqrt(np.sum(diff ** 2, axis=2))
+
+    np.fill_diagonal(dist, np.inf)
+
+    nearest = np.min(dist, axis=1)
+    nearest = nearest[np.isfinite(nearest)]
+
+    if nearest.size == 0:
+        raise ValueError("Could not estimate nearest-neighbor spacing.")
+
+    median_nearest = float(np.median(nearest))
+
+    return factor * median_nearest
+
+
+def nearest_distance_mask(
+    X: np.ndarray,
+    Y: np.ndarray,
+    measured_xy: np.ndarray,
+    radius_km: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    grid_xy = np.column_stack([X.ravel(), Y.ravel()])
+    measured_xy = np.asarray(measured_xy, dtype=float)
+
+    diff = grid_xy[:, None, :] - measured_xy[None, :, :]
+    dist2 = np.sum(diff ** 2, axis=2)
+
+    nearest_dist = np.sqrt(np.min(dist2, axis=1))
+    nearest_dist_grid = nearest_dist.reshape(X.shape)
+
+    mask = nearest_dist_grid <= radius_km
+
+    return mask, nearest_dist_grid
+
+
+def normalize_grid_with_dataset(
+    dataset: RadarSliceDataset,
+    X: np.ndarray,
+    Y: np.ndarray,
+) -> np.ndarray:
+    x_min = dataset.coord_scalers["x_km"]["min"]
+    x_max = dataset.coord_scalers["x_km"]["max"]
+
+    y_min = dataset.coord_scalers["y_km"]["min"]
+    y_max = dataset.coord_scalers["y_km"]["max"]
+
+    Xn = 2.0 * (X - x_min) / (x_max - x_min) - 1.0
+    Yn = 2.0 * (Y - y_min) / (y_max - y_min) - 1.0
+
+    coords_grid = np.column_stack([Xn.ravel(), Yn.ravel()]).astype(np.float32)
+
+    return coords_grid
+
+
+def make_collocation_pool(
+    dataset: RadarSliceDataset,
+    df: pd.DataFrame,
+    grid_nx: int,
+    grid_ny: int,
+    padding_frac: float,
+    nearest_radius_factor: float,
+) -> tuple[torch.Tensor, float, float]:
+    measured_xy = df[["x_km", "y_km"]].to_numpy(dtype=float)
+
+    Xc, Yc = make_query_grid_from_points(
+        x_km=df["x_km"].to_numpy(dtype=float),
+        y_km=df["y_km"].to_numpy(dtype=float),
+        nx=grid_nx,
+        ny=grid_ny,
+        padding_frac=padding_frac,
+    )
+
+    nearest_radius_km = estimate_nearest_radius(
+        measured_xy,
+        factor=nearest_radius_factor,
+    )
+
+    valid_mask, _ = nearest_distance_mask(
+        Xc,
+        Yc,
+        measured_xy,
+        radius_km=nearest_radius_km,
+    )
+
+    coords_grid_np = normalize_grid_with_dataset(dataset, Xc, Yc)
+    coords_col_np = coords_grid_np[valid_mask.ravel()]
+
+    if coords_col_np.shape[0] == 0:
+        raise RuntimeError("No valid collocation points were created.")
+
+    coords_col = torch.from_numpy(coords_col_np.astype(np.float32))
+
+    return coords_col, nearest_radius_km, float(valid_mask.mean())
+
+
+def sample_collocation_points(
+    collocation_pool: torch.Tensor,
+    num_collocation: int,
+) -> torch.Tensor:
+    """
+    If num_collocation <= 0, use all collocation points.
+    """
+
+    n_total = collocation_pool.shape[0]
+
+    if num_collocation <= 0 or num_collocation >= n_total:
+        idx = torch.arange(n_total, device=collocation_pool.device)
+    else:
+        idx = torch.randperm(n_total, device=collocation_pool.device)[:num_collocation]
+
+    return collocation_pool[idx]
+
+
+# ============================================================
+# DATA-DERIVED GRADIENT CAP
+# ============================================================
+
+def estimate_gradient_cap_from_data(
+    df: pd.DataFrame,
+    percentile: float,
+    factor: float,
+) -> dict[str, float]:
+    """
+    Estimate a plausible local gradient scale from real measured data.
+
+    Uses Delaunay edges so we only compare local neighboring points.
+
+    Gradient units:
+        dex / km
+
+    because:
+        value = log10(Ne)
+        distance = km
+    """
+
+    points_xy = df[["x_km", "y_km"]].to_numpy(dtype=float)
+    values = df["log10_Ne"].to_numpy(dtype=float)
+
+    if points_xy.shape[0] < 3:
+        raise ValueError("Need at least 3 points to estimate local gradients.")
+
+    tri = Delaunay(points_xy)
+
+    edges = set()
+
+    for simplex in tri.simplices:
+        i0, i1, i2 = simplex
+
+        pairs = [
+            (i0, i1),
+            (i1, i2),
+            (i2, i0),
+        ]
+
+        for a, b in pairs:
+            a = int(a)
+            b = int(b)
+
+            if a > b:
+                a, b = b, a
+
+            edges.add((a, b))
+
+    gradients = []
+
+    for a, b in edges:
+        dx = points_xy[a, 0] - points_xy[b, 0]
+        dy = points_xy[a, 1] - points_xy[b, 1]
+
+        dist_km = float(np.sqrt(dx ** 2 + dy ** 2))
+
+        if dist_km <= 0.0:
+            continue
+
+        dv = float(abs(values[a] - values[b]))
+        gradients.append(dv / dist_km)
+
+    gradients = np.asarray(gradients, dtype=float)
+
+    if gradients.size == 0:
+        raise ValueError("No valid gradients could be estimated from data.")
+
+    g_median = float(np.median(gradients))
+    g_p = float(np.percentile(gradients, percentile))
+    g_max_obs = float(np.max(gradients))
+    g_cap = float(factor * g_p)
+
+    return {
+        "n_edges": int(gradients.size),
+        "median_grad_dex_per_km": g_median,
+        "percentile_grad_dex_per_km": g_p,
+        "max_observed_grad_dex_per_km": g_max_obs,
+        "grad_cap_dex_per_km": g_cap,
+    }
+
+
+def physical_gradient_from_normalized_model(
+    model: torch.nn.Module,
+    coords_col: torch.Tensor,
+    dataset: RadarSliceDataset,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute physical gradients of log10(Ne) with respect to km.
+
+    The model outputs normalized log10(Ne), and its input coords are normalized.
+
+    Conversion:
+
+        log10Ne = 0.5 * (pred_norm + 1) * target_range + target_min
+
+        x_norm = 2 * (x_km - x_min) / x_range
+
+    Therefore:
+
+        d log10Ne / dx_km =
+            d pred_norm / dx_norm * target_range / x_range
+
+    and similarly for y.
+    """
+
+    coords_col = coords_col.detach().clone().requires_grad_(True)
+
+    pred_norm = model(coords_col)
+
+    grad_norm = torch.autograd.grad(
+        outputs=pred_norm,
+        inputs=coords_col,
+        grad_outputs=torch.ones_like(pred_norm),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    x_range_km = (
+        dataset.coord_scalers["x_km"]["max"]
+        - dataset.coord_scalers["x_km"]["min"]
+    )
+
+    y_range_km = (
+        dataset.coord_scalers["y_km"]["max"]
+        - dataset.coord_scalers["y_km"]["min"]
+    )
+
+    target_range = (
+        dataset.target_scaler["max"]
+        - dataset.target_scaler["min"]
+    )
+
+    gx = grad_norm[:, 0:1] * (target_range / x_range_km)
+    gy = grad_norm[:, 1:2] * (target_range / y_range_km)
+
+    grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-20)
+
+    return gx, gy, grad_mag
+
+
+def gradient_cap_loss(
+    model: torch.nn.Module,
+    coords_col: torch.Tensor,
+    dataset: RadarSliceDataset,
+    grad_cap_dex_per_km: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """
+    Penalize only gradients above a data-derived cap.
+
+    Dimensionless loss:
+
+        mean( ReLU(|grad| / grad_cap - 1)^2 )
+
+    If |grad| is below the cap, there is no penalty.
+    """
+
+    if grad_cap_dex_per_km <= 0.0:
+        raise ValueError("grad_cap_dex_per_km must be positive.")
+
+    _, _, grad_mag = physical_gradient_from_normalized_model(
+        model=model,
+        coords_col=coords_col,
+        dataset=dataset,
+    )
+
+    ratio = grad_mag / grad_cap_dex_per_km
+    excess = torch.relu(ratio - 1.0)
+
+    loss = torch.mean(excess ** 2)
+
+    with torch.no_grad():
+        violation_frac = torch.mean((ratio > 1.0).float()).item()
+        mean_grad = torch.mean(grad_mag).item()
+        max_grad = torch.max(grad_mag).item()
+        p95_grad = torch.quantile(grad_mag.flatten(), 0.95).item()
+
+    stats = {
+        "gradcap_violation_frac": float(violation_frac),
+        "mean_grad_dex_per_km": float(mean_grad),
+        "p95_grad_dex_per_km": float(p95_grad),
+        "max_grad_dex_per_km": float(max_grad),
+    }
+
+    return loss, stats
+
+
+# ============================================================
+# CURVATURE LOSS
+# ============================================================
+
+def spatial_curvature_loss(
+    model: torch.nn.Module,
+    coords_col: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Curvature / anti-ringing loss.
+
+    This computes:
+
+        mean( fxx^2 + 2 fxy^2 + fyy^2 )
+
+    Derivatives are with respect to normalized coordinates.
+    """
+
+    coords_col = coords_col.detach().clone().requires_grad_(True)
+
+    pred = model(coords_col)
+
+    grad = torch.autograd.grad(
+        outputs=pred,
+        inputs=coords_col,
+        grad_outputs=torch.ones_like(pred),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    fx = grad[:, 0:1]
+    fy = grad[:, 1:2]
+
+    grad_fx = torch.autograd.grad(
+        outputs=fx,
+        inputs=coords_col,
+        grad_outputs=torch.ones_like(fx),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    grad_fy = torch.autograd.grad(
+        outputs=fy,
+        inputs=coords_col,
+        grad_outputs=torch.ones_like(fy),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    fxx = grad_fx[:, 0:1]
+    fxy = grad_fx[:, 1:2]
+    fyy = grad_fy[:, 1:2]
+
+    curv_loss = torch.mean(fxx ** 2 + 2.0 * fxy ** 2 + fyy ** 2)
+
+    return curv_loss
+
+
+@torch.no_grad()
+def evaluate_model_on_grid(
+    model: torch.nn.Module,
+    coords_grid_np: np.ndarray,
+    dataset: RadarSliceDataset,
+    device: torch.device,
+    chunk_size: int,
+) -> np.ndarray:
+    model.eval()
+
+    outputs = []
+    n = coords_grid_np.shape[0]
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+
+        coords_chunk = torch.from_numpy(coords_grid_np[start:end]).to(device)
+        pred_chunk = model(coords_chunk).detach().cpu().numpy()
+
+        outputs.append(pred_chunk)
+
+    pred_norm = np.concatenate(outputs, axis=0)
+    pred_log10 = dataset.denormalize_target(pred_norm)
+
+    return pred_log10[:, 0]
+
+
+# ============================================================
+# PLOTTING HELPERS
+# ============================================================
+
+def plot_measured_points(
+    df: pd.DataFrame,
+    out_dir: Path,
+    save_plots: bool,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    sc = ax.scatter(
+        df["x_km"],
+        df["y_km"],
+        c=df["log10_Ne"],
+        s=45,
+        edgecolor="k",
+        linewidth=0.4,
+    )
+
+    fig.colorbar(sc, ax=ax, label="measured log10(Ne)")
+
+    ax.set_xlabel("x east [km]")
+    ax.set_ylabel("y north [km]")
+    ax.set_title("Measured AMISR slice")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.3)
+
+    if save_plots:
+        path = out_dir / "measured_points_log10Ne.png"
+        fig.savefig(path, dpi=200)
+
+    plt.close(fig)
+
+
+def plot_grid_prediction(
+    X: np.ndarray,
+    Y: np.ndarray,
+    pred_grid_masked: np.ndarray,
+    df: pd.DataFrame,
+    out_dir: Path,
+    save_plots: bool,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    vmin = float(df["log10_Ne"].min())
+    vmax = float(df["log10_Ne"].max())
+
+    im = ax.pcolormesh(
+        X,
+        Y,
+        pred_grid_masked,
+        shading="auto",
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+    fig.colorbar(im, ax=ax, label="SIREN log10(Ne), masked grid")
+
+    ax.scatter(
+        df["x_km"],
+        df["y_km"],
+        c=df["log10_Ne"],
+        s=35,
+        edgecolor="k",
+        linewidth=0.4,
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+    ax.set_xlabel("x east [km]")
+    ax.set_ylabel("y north [km]")
+    ax.set_title("SIREN reconstruction with curvature + gradient-cap loss")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.3)
+
+    if save_plots:
+        path = out_dir / "siren_grid_masked_log10Ne.png"
+        fig.savefig(path, dpi=200)
+
+    plt.close(fig)
+
+
+def plot_residuals(
+    pred_df: pd.DataFrame,
+    out_dir: Path,
+    save_plots: bool,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    sc = ax.scatter(
+        pred_df["x_km"],
+        pred_df["y_km"],
+        c=pred_df["resid_log10_Ne"],
+        s=45,
+        edgecolor="k",
+        linewidth=0.4,
+    )
+
+    fig.colorbar(sc, ax=ax, label="prediction - measured log10(Ne)")
+
+    ax.set_xlabel("x east [km]")
+    ax.set_ylabel("y north [km]")
+    ax.set_title("Residuals at measured radar points")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.3)
+
+    if save_plots:
+        path = out_dir / "measured_point_residuals_log10Ne.png"
+        fig.savefig(path, dpi=200)
+
+    plt.close(fig)
+
+
+def plot_history(
+    history_path: Path,
+    out_dir: Path,
+    save_plots: bool,
+) -> None:
+    hist = pd.read_csv(history_path)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    ax.plot(hist["step"], hist["total_loss"], marker="o", markersize=3, label="total")
+    ax.plot(hist["step"], hist["data_loss"], marker="o", markersize=3, label="data")
+    ax.plot(hist["step"], hist["curv_loss_weighted"], marker="o", markersize=3, label="weighted curvature")
+    ax.plot(hist["step"], hist["gradcap_loss_weighted"], marker="o", markersize=3, label="weighted grad cap")
+
+    ax.set_xlabel("step")
+    ax.set_ylabel("loss")
+    ax.set_title("Training loss")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    if save_plots:
+        path = out_dir / "training_history.png"
+        fig.savefig(path, dpi=200)
+
+    plt.close(fig)
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def train(args: argparse.Namespace) -> None:
+    set_seed(args.seed)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    save_plots = not args.no_plots
+
+    history_path = out_dir / "history.csv"
+
+    if history_path.exists() and not args.resume_history:
+        history_path.unlink()
+
+    config_path = out_dir / "run_config.json"
+
+    with open(config_path, "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
+    )
+
+    print(f"Using device: {device}")
+
+    # ------------------------------------------------------------
+    # 1. Load dataset
+    # ------------------------------------------------------------
+    dataset = RadarSliceDataset(csv_path=args.csv_path)
+    dataset.summary()
+
+    sample = dataset[0]
+
+    full_coords = sample["coords"].to(device)
+    full_values = sample["values"].to(device)
+
+    df = dataset.df.copy()
+
+    n_total = full_coords.shape[0]
+
+    print()
+    print("Training data:")
+    print(f"  measured points: {n_total}")
+    print(f"  coords shape:    {tuple(full_coords.shape)}")
+    print(f"  values shape:    {tuple(full_values.shape)}")
+
+    if args.batch_size <= 0 or args.batch_size >= n_total:
+        print("  training mode:   full batch")
+    else:
+        print(f"  training mode:   minibatch, batch_size={args.batch_size}")
+
+    # ------------------------------------------------------------
+    # 2. Data-derived gradient cap
+    # ------------------------------------------------------------
+    gradcap_info = estimate_gradient_cap_from_data(
+        df=df,
+        percentile=args.grad_cap_percentile,
+        factor=args.grad_cap_factor,
+    )
+
+    grad_cap_dex_per_km = gradcap_info["grad_cap_dex_per_km"]
+
+    print()
+    print("Data-derived gradient cap:")
+    print(f"  Delaunay edges:          {gradcap_info['n_edges']}")
+    print(f"  median grad [dex/km]:    {gradcap_info['median_grad_dex_per_km']:.6e}")
+    print(f"  p{args.grad_cap_percentile:g} grad [dex/km]:      {gradcap_info['percentile_grad_dex_per_km']:.6e}")
+    print(f"  max observed [dex/km]:   {gradcap_info['max_observed_grad_dex_per_km']:.6e}")
+    print(f"  cap factor:              {args.grad_cap_factor:.3f}")
+    print(f"  gradient cap [dex/km]:   {grad_cap_dex_per_km:.6e}")
+
+    # ------------------------------------------------------------
+    # 3. Collocation pool
+    # ------------------------------------------------------------
+    collocation_pool, collocation_radius_km, collocation_valid_fraction = make_collocation_pool(
+        dataset=dataset,
+        df=df,
+        grid_nx=args.collocation_grid_nx,
+        grid_ny=args.collocation_grid_ny,
+        padding_frac=args.grid_padding_frac,
+        nearest_radius_factor=args.nearest_radius_factor,
+    )
+
+    collocation_pool = collocation_pool.to(device)
+
+    print()
+    print("Collocation points:")
+    print(f"  pool size:             {collocation_pool.shape[0]}")
+    print(f"  sample per step:       {args.num_collocation}")
+    print(f"  nearest radius [km]:   {collocation_radius_km:.3f}")
+    print(f"  valid grid fraction:   {collocation_valid_fraction:.3f}")
+    print(f"  lambda_curv:           {args.lambda_curv}")
+    print(f"  lambda_gradcap:        {args.lambda_gradcap}")
+    print(f"  reg_ramp_frac:         {args.reg_ramp_frac}")
+
+    # ------------------------------------------------------------
+    # 4. Build model
+    # ------------------------------------------------------------
+    model = MLPINR(
+        in_features=dataset.in_features,
+        out_features=dataset.out_features,
+        hidden_features=args.hidden_features,
+        hidden_layers=args.hidden_layers,
+        activation=args.activation,
+        first_omega_0=args.first_omega_0,
+        hidden_omega_0=args.hidden_omega_0,
+        outermost_linear=True,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    print()
+    print("Model config:")
+    print(f"  activation:       {args.activation}")
+    print(f"  hidden_features:  {args.hidden_features}")
+    print(f"  hidden_layers:    {args.hidden_layers}")
+    print(f"  first_omega_0:    {args.first_omega_0}")
+    print(f"  hidden_omega_0:   {args.hidden_omega_0}")
+    print(f"  lr:               {args.lr}")
+    print(f"  num_steps:        {args.num_steps}")
+
+    # ------------------------------------------------------------
+    # 5. Train
+    # ------------------------------------------------------------
+    history_fields = [
+        "step",
+        "total_loss",
+        "data_loss",
+        "curv_loss_raw",
+        "curv_loss_weighted",
+        "lambda_curv_eff",
+        "gradcap_loss_raw",
+        "gradcap_loss_weighted",
+        "lambda_gradcap_eff",
+        "grad_cap_dex_per_km",
+        "gradcap_violation_frac",
+        "mean_grad_dex_per_km",
+        "p95_grad_dex_per_km",
+        "max_grad_dex_per_km",
+        "rmse_log10",
+        "mae_log10",
+        "bias_log10",
+        "max_abs_log10",
+        "p95_abs_log10",
+        "p99_abs_log10",
+    ]
+
+    latest_metrics = {
+        "rmse": np.nan,
+        "mae": np.nan,
+        "bias": np.nan,
+        "max_abs": np.nan,
+        "p95_abs": np.nan,
+        "p99_abs": np.nan,
+    }
+
+    latest_gradcap_stats = {
+        "gradcap_violation_frac": np.nan,
+        "mean_grad_dex_per_km": np.nan,
+        "p95_grad_dex_per_km": np.nan,
+        "max_grad_dex_per_km": np.nan,
+    }
+
+    pbar = tqdm(
+        range(1, args.num_steps + 1),
+        disable=args.disable_tqdm,
+        dynamic_ncols=True,
+        leave=True,
+        file=sys.stdout,
+        mininterval=0.5,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                   "[{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+    )
+
+    for step in pbar:
+        model.train()
+
+        batch_coords, batch_values = sample_batch(
+            full_coords,
+            full_values,
+            args.batch_size,
+        )
+
+        pred = model(batch_coords)
+        data_loss = F.mse_loss(pred, batch_values)
+
+        coords_col = sample_collocation_points(
+            collocation_pool=collocation_pool,
+            num_collocation=args.num_collocation,
+        )
+
+        if args.lambda_curv > 0.0:
+            curv_loss_raw = spatial_curvature_loss(
+                model=model,
+                coords_col=coords_col,
+            )
+
+            lambda_curv_eff = ramp_weight(
+                target_weight=args.lambda_curv,
+                step=step,
+                num_steps=args.num_steps,
+                ramp_frac=args.reg_ramp_frac,
+            )
+        else:
+            curv_loss_raw = data_loss.new_tensor(0.0)
+            lambda_curv_eff = 0.0
+
+        if args.lambda_gradcap > 0.0:
+            gradcap_loss_raw, gradcap_stats = gradient_cap_loss(
+                model=model,
+                coords_col=coords_col,
+                dataset=dataset,
+                grad_cap_dex_per_km=grad_cap_dex_per_km,
+            )
+
+            lambda_gradcap_eff = ramp_weight(
+                target_weight=args.lambda_gradcap,
+                step=step,
+                num_steps=args.num_steps,
+                ramp_frac=args.reg_ramp_frac,
+            )
+
+            latest_gradcap_stats = gradcap_stats
+        else:
+            gradcap_loss_raw = data_loss.new_tensor(0.0)
+            lambda_gradcap_eff = 0.0
+
+            gradcap_stats = {
+                "gradcap_violation_frac": 0.0,
+                "mean_grad_dex_per_km": 0.0,
+                "p95_grad_dex_per_km": 0.0,
+                "max_grad_dex_per_km": 0.0,
+            }
+
+            latest_gradcap_stats = gradcap_stats
+
+        curv_loss_weighted = lambda_curv_eff * curv_loss_raw
+        gradcap_loss_weighted = lambda_gradcap_eff * gradcap_loss_raw
+
+        total_loss = data_loss + curv_loss_weighted + gradcap_loss_weighted
+
+        optimizer.zero_grad(set_to_none=True)
+        total_loss.backward()
+        optimizer.step()
+
+        if step == 1 or step % args.summary_every == 0 or step == args.num_steps:
+            model.eval()
+
+            with torch.no_grad():
+                pred_norm_np = model(full_coords).detach().cpu().numpy()
+
+            pred_df = dataset.make_prediction_dataframe(pred_norm_np)
+
+            metrics = compute_metrics(
+                pred=pred_df["pred_log10_Ne"].to_numpy(),
+                target=pred_df["log10_Ne"].to_numpy(),
+            )
+
+            latest_metrics = metrics
+
+            row = {
+                "step": step,
+                "total_loss": float(total_loss.item()),
+                "data_loss": float(data_loss.item()),
+                "curv_loss_raw": float(curv_loss_raw.item()),
+                "curv_loss_weighted": float(curv_loss_weighted.item()),
+                "lambda_curv_eff": float(lambda_curv_eff),
+                "gradcap_loss_raw": float(gradcap_loss_raw.item()),
+                "gradcap_loss_weighted": float(gradcap_loss_weighted.item()),
+                "lambda_gradcap_eff": float(lambda_gradcap_eff),
+                "grad_cap_dex_per_km": float(grad_cap_dex_per_km),
+                "gradcap_violation_frac": float(gradcap_stats["gradcap_violation_frac"]),
+                "mean_grad_dex_per_km": float(gradcap_stats["mean_grad_dex_per_km"]),
+                "p95_grad_dex_per_km": float(gradcap_stats["p95_grad_dex_per_km"]),
+                "max_grad_dex_per_km": float(gradcap_stats["max_grad_dex_per_km"]),
+                "rmse_log10": metrics["rmse"],
+                "mae_log10": metrics["mae"],
+                "bias_log10": metrics["bias"],
+                "max_abs_log10": metrics["max_abs"],
+                "p95_abs_log10": metrics["p95_abs"],
+                "p99_abs_log10": metrics["p99_abs"],
+            }
+
+            append_csv_row(history_path, history_fields, row)
+
+        if step == 1 or step % args.log_every == 0 or step == args.num_steps:
+            pbar.set_postfix_str(
+                f"tot={total_loss.item():.2e} "
+                f"data={data_loss.item():.2e} "
+                f"curvW={curv_loss_weighted.item():.2e} "
+                f"gcapW={gradcap_loss_weighted.item():.2e} "
+                f"viol={latest_gradcap_stats['gradcap_violation_frac']:.2f} "
+                f"rmse={latest_metrics['rmse']:.2e}"
+            )
+
+    # ------------------------------------------------------------
+    # 6. Save model and measured-point predictions
+    # ------------------------------------------------------------
+    model.eval()
+
+    with torch.no_grad():
+        pred_norm_np = model(full_coords).detach().cpu().numpy()
+
+    pred_df = dataset.make_prediction_dataframe(pred_norm_np)
+
+    pred_csv = out_dir / "predictions_at_measured_points.csv"
+    pred_df.to_csv(pred_csv, index=False)
+
+    final_metrics = compute_metrics(
+        pred=pred_df["pred_log10_Ne"].to_numpy(),
+        target=pred_df["log10_Ne"].to_numpy(),
+    )
+
+    model_path = out_dir / "model_final.pt"
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": vars(args),
+            "coord_scalers": dataset.coord_scalers,
+            "target_scaler": dataset.target_scaler,
+            "final_metrics": final_metrics,
+            "gradcap_info": gradcap_info,
+        },
+        model_path,
+    )
+
+    print()
+    print(f"Saved model: {model_path}")
+    print(f"Saved history: {history_path}")
+    print(f"Saved measured-point predictions: {pred_csv}")
+
+    print()
+    print("Final measured-point metrics in log10(Ne):")
+    for key, value in final_metrics.items():
+        print(f"  {key:12s}: {value:.8e}")
+
+    # ------------------------------------------------------------
+    # 7. Dense query grid for visualization only
+    # ------------------------------------------------------------
+    measured_xy = df[["x_km", "y_km"]].to_numpy(dtype=float)
+
+    X, Y = make_query_grid_from_points(
+        x_km=df["x_km"].to_numpy(dtype=float),
+        y_km=df["y_km"].to_numpy(dtype=float),
+        nx=args.grid_nx,
+        ny=args.grid_ny,
+        padding_frac=args.grid_padding_frac,
+    )
+
+    coords_grid_np = normalize_grid_with_dataset(dataset, X, Y)
+
+    pred_grid_log10_flat = evaluate_model_on_grid(
+        model=model,
+        coords_grid_np=coords_grid_np,
+        dataset=dataset,
+        device=device,
+        chunk_size=args.grid_chunk_size,
+    )
+
+    pred_grid_log10 = pred_grid_log10_flat.reshape(X.shape)
+
+    # ------------------------------------------------------------
+    # 8. Valid footprint mask
+    # ------------------------------------------------------------
+    nearest_radius_km = estimate_nearest_radius(
+        measured_xy,
+        factor=args.nearest_radius_factor,
+    )
+
+    valid_mask, nearest_dist_grid = nearest_distance_mask(
+        X,
+        Y,
+        measured_xy,
+        radius_km=nearest_radius_km,
+    )
+
+    pred_grid_masked = pred_grid_log10.copy()
+    pred_grid_masked[~valid_mask] = np.nan
+
+    print()
+    print("Query grid:")
+    print(f"  X/Y shape:             {X.shape}")
+    print("  grid use:              visualization only")
+    print("  mask type:             nearest real radar point")
+    print(f"  nearest radius [km]:   {nearest_radius_km:.3f}")
+    print(f"  valid grid fraction:   {valid_mask.mean():.3f}")
+
+    if args.save_grid_csv:
+        grid_df = pd.DataFrame(
+            {
+                "x_km": X.ravel(),
+                "y_km": Y.ravel(),
+                "pred_log10_Ne": pred_grid_log10.ravel(),
+                "nearest_dist_km": nearest_dist_grid.ravel(),
+                "valid_mask": valid_mask.ravel(),
+            }
+        )
+
+        grid_csv = out_dir / "grid_predictions.csv"
+        grid_df.to_csv(grid_csv, index=False)
+        print(f"Saved grid predictions: {grid_csv}")
+
+    # ------------------------------------------------------------
+    # 9. Plots
+    # ------------------------------------------------------------
+    if save_plots:
+        plot_measured_points(df, out_dir, save_plots=save_plots)
+        plot_grid_prediction(X, Y, pred_grid_masked, df, out_dir, save_plots=save_plots)
+        plot_residuals(pred_df, out_dir, save_plots=save_plots)
+        plot_history(history_path, out_dir, save_plots=save_plots)
+
+        print(f"Saved plots in: {out_dir}")
+
+    print()
+    print("DONE")
+
+
+# ============================================================
+# ARGUMENTS
+# ============================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+
+    # Data
+    parser.add_argument(
+        "--csv_path",
+        type=str,
+        default="data/slice111748_h330_best_slice.csv",
+        help="Prepared AMISR 2D slice CSV.",
+    )
+
+    # Model
+    parser.add_argument(
+        "--activation",
+        type=str,
+        default="sine",
+        choices=["relu", "tanh", "softplus", "sine"],
+    )
+    parser.add_argument("--hidden_features", type=int, default=256)
+    parser.add_argument("--hidden_layers", type=int, default=3)
+    parser.add_argument("--first_omega_0", type=float, default=30.0)
+    parser.add_argument("--hidden_omega_0", type=float, default=30.0)
+
+    # Training
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=0,
+        help="0 or >= N means full batch.",
+    )
+    parser.add_argument("--num_steps", type=int, default=10000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cpu", action="store_true")
+
+    # Curvature regularization
+    parser.add_argument("--lambda_curv", type=float, default=0.0)
+
+    # Gradient-cap regularization
+    parser.add_argument("--lambda_gradcap", type=float, default=0.0)
+    parser.add_argument("--grad_cap_percentile", type=float, default=90.0)
+    parser.add_argument("--grad_cap_factor", type=float, default=5.0)
+
+    # Collocation
+    parser.add_argument(
+        "--num_collocation",
+        type=int,
+        default=0,
+        help="0 means use all collocation points.",
+    )
+    parser.add_argument("--collocation_grid_nx", type=int, default=80)
+    parser.add_argument("--collocation_grid_ny", type=int, default=80)
+    parser.add_argument("--reg_ramp_frac", type=float, default=0.2)
+
+    # Logging
+    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--summary_every", type=int, default=250)
+    parser.add_argument("--disable_tqdm", action="store_true")
+    parser.add_argument("--resume_history", action="store_true")
+
+    # Grid visualization
+    parser.add_argument("--grid_nx", type=int, default=250)
+    parser.add_argument("--grid_ny", type=int, default=250)
+    parser.add_argument("--grid_padding_frac", type=float, default=0.05)
+    parser.add_argument("--grid_chunk_size", type=int, default=65536)
+
+    # Nearest-distance mask
+    parser.add_argument("--nearest_radius_factor", type=float, default=2.5)
+
+    # Outputs
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="outputs/radar_2d_curv_gradcap",
+    )
+    parser.add_argument("--no_plots", action="store_true")
+    parser.add_argument("--save_grid_csv", action="store_true")
+
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+    train(args)

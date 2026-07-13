@@ -1,0 +1,2 @@
+h0_km,half_width_km,n_points,n_beams,beam_fraction,area_km2,dz_rms_km,dz_max_abs_km,median_rel_dNe,log10_Ne_std,area_norm,uncertainty_penalty,dz_penalty,score
+330.0,15.0,42,42,1.0,110919.02085167896,7.397111365489468,12.280229575692601,0.10627702444463813,0.3135280228801205,1.0,0.10627702444463813,0.4931407576992978,5.6471525967057135
