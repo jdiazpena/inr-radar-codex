@@ -93,6 +93,14 @@ def build_cases(scope: str) -> list[DataCase]:
         ]
         return cases + [shear_case(0)]
 
+    if scope == "overnight_125":
+        return [
+            ordinary_case(geometry, speed, integration, 0)
+            for geometry in ("sparse_grid", "sparse_23", "sparse_11")
+            for speed in (0.36, 2.0)
+            for integration in (60, 120, 300)
+        ]
+
     core = [
         ordinary_case(geometry, speed, integration, seed)
         for geometry in ("sparse_grid", "sparse_23", "sparse_11")
@@ -176,7 +184,7 @@ def train_case(
         print(f"[train] complete; skipping {case.case_id}/{regularization}")
         return run_dir
     if run_dir.exists() and any(run_dir.iterdir()):
-        raise RuntimeError(f"Incomplete run directory exists: {run_dir}")
+        print(f"[train] incomplete; restarting {case.case_id}/{regularization}")
 
     command = [
         python,
@@ -309,7 +317,11 @@ def collect_metrics(cases: list[DataCase], root: Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scope", choices=["smoke", "pilot", "core", "full"], default="pilot")
+    parser.add_argument(
+        "--scope",
+        choices=["smoke", "pilot", "overnight_125", "core", "full"],
+        default="pilot",
+    )
     parser.add_argument("--stage", choices=["manifest", "generate", "train", "analyze", "check", "all"], default="generate")
     parser.add_argument("--output_root", type=Path, default=Path("outputs/velocity_integration_benchmark"))
     parser.add_argument("--python", default=sys.executable)
